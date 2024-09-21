@@ -1,0 +1,36 @@
+model_config:
+  name: 'ldm'
+  manual_seed: 42
+  learning_rate: 0.0001
+  h_dims: [128, 128, 128] # 56, 28, 14
+  in_res: 56
+  attn_res: [14]
+  down_index: [0, 1, 1]
+  with_conv: True
+  dropout: 0.1
+  diffusion_steps: 100
+  sampling_period: 1
+  grid: 2
+  weight_decay: 0.00001
+  scheduler_gamma: 0.99
+
+data_config:
+  data_dir: "data/flowers/train"
+  in_res: 56
+  batch_size: 16
+  num_workers: 4
+  use_manual_split: True
+
+trainer_config:
+  accelerator: 'gpu'
+  devices: 1
+  max_epochs: 1000
+  precision: 16-mixed
+
+log_config:
+  name: "ldm"
+  save_dir: "logs/"
+  check_dir: "logs/check"
+  checkpoint: False
+  model_summary: False
+  

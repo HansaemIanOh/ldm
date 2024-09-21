@@ -1,0 +1,39 @@
+model_config:
+  name: 'autoencoder'
+  manual_seed: 42
+  learning_rate: 0.0001
+  h_dims: [3, 128, 128, 128]
+  in_res: 224
+  attn_res: [14]
+  down_index: [0, 1, 1, 0]
+  dropout: 0.1
+  with_conv: True
+  latent_dim: 128
+  diffusion_steps: 100
+  sampling_period: 1
+  grid: 2
+  kld_factor: 0.0001
+  weight_decay: 0.00001
+  scheduler_gamma: 0.99
+  deterministic: True
+
+data_config:
+  data_dir: "data/flowers/train"
+  in_res: 224
+  batch_size: 16
+  num_workers: 4
+  use_manual_split: True
+
+trainer_config:
+  accelerator: 'gpu'
+  devices: 1
+  max_epochs: 1
+  precision: 16-mixed
+
+log_config:
+  name: "autoencoder"
+  save_dir: "logs/"
+  check_dir: "logs/check"
+  checkpoint: True
+  model_summary: False
+  
