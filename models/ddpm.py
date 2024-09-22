@@ -22,7 +22,7 @@ class DownBlock(nn.Module):
         else:
             self.layers.append(nn.AvgPool2d((2, 2)))
 
-    def forward(self, x : Tensor, temb : Tensor) -> Tensor:
+    def forward(self, x : Tensor, temb: Optional[Tensor]=None) -> Tensor:
         h = x
         for module in self.layers:
             h = module(h)
@@ -36,7 +36,7 @@ class UpBlock(nn.Module):
         if with_conv:
             self.layers.append(nn.Conv2d(in_features, out_features, kernel_size=(3, 3), stride=1, padding=1))
 
-    def forward(self, x : Tensor, temb : Tensor) -> Tensor:
+    def forward(self, x : Tensor, temb: Optional[Tensor]=None) -> Tensor:
         h = x
         for module in self.layers:
             h = module(h)
@@ -68,9 +68,8 @@ class ResNetBlock(nn.Module):
                 self.layers.append(nn.Conv2d(out_features, out_features, kernel_size=(3, 3), stride=1, padding=1)) # x to x
             else:
                 self.layers.append(nn.Conv2d(in_features, out_features, kernel_size=(1, 1), stride=1, padding=0)) # x to x
-    def forward(self, x : Tensor, temb=None) -> Tensor:
-        # if temb==None:
-        #     temb = torch.randint(0, self.t_max, (x.shape[0], 64), device=x.device, dtype=x.dtype)
+
+    def forward(self, x: Tensor, temb: Optional[Tensor]=None) -> Tensor:
         h = x
         for module in self.block1:
             h = module(h)
@@ -90,20 +89,37 @@ class ResNetBlock(nn.Module):
 class AttnBlock(nn.Module):
     def __init__(self, features):
         super().__init__()
-        self.linear1 = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
-        self.linear2 = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
-        self.norm = nn.BatchNorm2d(features)
+        self.features = features
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=features, eps=1e-6, affine=True)
 
-    def forward(self, x : Tensor, temb : Tensor) -> Tensor:
-        
-        h = self.norm(x)
-        q = self.linear1(h).view(h.shape[0], h.shape[1], h.shape[2] * h.shape[3])
-        k = self.linear1(h).view(h.shape[0], h.shape[1], h.shape[2] * h.shape[3])
-        v = self.linear1(h).view(h.shape[0], h.shape[1], h.shape[2] * h.shape[3])
-        w = torch.matmul(q, k.transpose(-2, -1)) * (int(k.shape[1]) ** (-0.5))
+        self.q_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
+        self.k_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
+        self.v_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
+        self.linear = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
+
+    def forward(self, x: Tensor, temb: Optional[Tensor]=None) -> Tensor:
+        '''
+        x : [B, C, H, W]
+        return : [B, C, H, W]
+        '''
+        h = x
+        # print(self.features, h.shape)
+        h = self.norm(h)
+        q = self.q_proj(h)
+        k = self.k_proj(h)
+        v = self.v_proj(h)
+        B, C, H, W = x.shape
+        # S = HW, F = C, s = S, S:For q, s:For k and v
+        q = q.view(B, C, H*W) # [B, F, S]
+        q = q.permute(0, 2, 1).contiguous() # [B, S, F]
+        k = k.view(B, C, H*W) # [B, F, s]
+        v = v.view(B, C, H*W) # [B, F, s]
+        w = torch.einsum('BSF, BFs -> BSs', q, k) * (C ** (-0.5))
         w = F.softmax(w, dim=-1)
-        h = torch.matmul(w, v).view(h.shape)
-        h = self.linear2(h)
+        w = w.permute(0, 2, 1).contiguous()
+        h = torch.einsum('BFs, BsS -> BFS', v, w)
+        h = h.view(B, C, H, W)
+        h = self.linear(h)
         return x + h
 
 def timeembed(t, embedding_dim):

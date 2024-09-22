@@ -10,6 +10,7 @@ import pytorch_lightning as pl
 from torchmetrics import Accuracy
 import torchvision.utils as vutils
 from safetensors.torch import save_file, load_file
+from .autoencoder import AutoEncoderKL
 
 def match_dims(x, y): return list(x.shape) + [1] * (len(y.shape)-len(x.shape))
 
@@ -90,20 +91,38 @@ class ResNetBlock(nn.Module):
 class AttnBlock(nn.Module):
     def __init__(self, features):
         super().__init__()
-        self.linear1 = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
-        self.linear2 = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
-        self.norm = nn.BatchNorm2d(features)
+        self.features = features
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=features, eps=1e-6, affine=True)
 
-    def forward(self, x : Tensor, temb : Tensor) -> Tensor:
+        self.q_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
+        self.k_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
+        self.v_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
+        self.linear = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
         
-        h = self.norm(x)
-        q = self.linear1(h).view(h.shape[0], h.shape[1], h.shape[2] * h.shape[3])
-        k = self.linear1(h).view(h.shape[0], h.shape[1], h.shape[2] * h.shape[3])
-        v = self.linear1(h).view(h.shape[0], h.shape[1], h.shape[2] * h.shape[3])
-        w = torch.matmul(q, k.transpose(-2, -1)) * (int(k.shape[1]) ** (-0.5))
+
+    def forward(self, x : Tensor, temb = None) -> Tensor:
+        '''
+        x : [B, C, H, W]
+        return : [B, C, H, W]
+        '''
+        h = x
+        # print(self.features, h.shape)
+        h = self.norm(h)
+        q = self.q_proj(h)
+        k = self.k_proj(h)
+        v = self.v_proj(h)
+        B, C, H, W = x.shape
+        # S = HW, F = C, s = S, S:For q, s:For k and v
+        q = q.view(B, C, H*W) # [B, F, S]
+        q = q.permute(0, 2, 1).contiguous() # [B, S, F]
+        k = k.view(B, C, H*W) # [B, F, s]
+        v = v.view(B, C, H*W) # [B, F, s]
+        w = torch.einsum('BSF, BFs -> BSs', q, k) * (C ** (-0.5))
         w = F.softmax(w, dim=-1)
-        h = torch.matmul(w, v).view(h.shape)
-        h = self.linear2(h)
+        w = w.permute(0, 2, 1).contiguous()
+        h = torch.einsum('BFs, BsS -> BFS', v, w)
+        h = h.view(B, C, H, W)
+        h = self.linear(h)
         return x + h
 
 def timeembed(t, embedding_dim):
@@ -155,7 +174,15 @@ class LatentDiffusion(pl.LightningModule):
         self.diffusion_steps = self.config.get('diffusion_steps')
         self.sampling_period = self.config.get('sampling_period')
         self.grid = self.config.get('grid')
-        self.autoencoder = self.config.get('autoencoder')
+        self.ae_config = self.config.get('ae_config')
+        self.ae_config['deterministic'] = True
+
+        ae_model = AutoEncoderKL(self.ae_config)
+        checkpoint_path = 'logs/autoencoder/version_0/checkpoints/last.safetensors' # temp
+        ae_model = ae_model.__class__.load_from_checkpoint(checkpoint_path, config=self.ae_config)
+        self.autoencoder = ae_model
+        for param in self.autoencoder.parameters():
+            param.requires_grad = False
         # ============================================================
 
         self.act = nn.LeakyReLU()
@@ -221,13 +248,12 @@ class LatentDiffusion(pl.LightningModule):
             ))
         self.train_losses = []
         self.val_losses = []
+
     def forward(self, x : Tensor, t= None) -> Tensor:
         if t == None:
             print("Test mode. It can't be trained.")
             t = torch.rand((x.shape[0],1, 1, 1), device=x.device) * 0
         h = x
-        print(h.shape)
-        exit()
         # Timestep embedding
         temb = timeembed(t, self.ch)
         temb = self.linear_1(temb)
@@ -235,23 +261,31 @@ class LatentDiffusion(pl.LightningModule):
 
         skip = []
         # Downsampling
+        # print("Down : ", h.shape)
         for module in self.Downsampling:
             h = module(h, temb)
+            # print("Down : ", h.shape)
             skip.append(h)
         # Middle
         for module in self.Middle:
             h = module(h, temb)
+            # print("Middle : ", h.shape)
         # Upsampling
         skip.reverse()
+        # print("Up : ", h.shape)
         for index, module in enumerate(self.Upsampling):
             h = h + skip[index]
             h = module(h, temb)
+            # print("Up : ", h.shape)
         # for module in self.Upsampling:
         #     h = module(h, temb)
         # End
         for module in self.End:
             h = module(h)
+            # print("End : ", h.shape)
+        # exit()
         return h
+
     # Cosine scheduler
     def diffusion_schedule(self, diffusion_times: int) -> List[Tensor]:
         min_signal_rate = 0.02
@@ -333,7 +367,8 @@ class LatentDiffusion(pl.LightningModule):
         x -> encode -> z
         '''
         x, y = batch
-        x_0 = self.autoencoder.encode(x)
+        posterior = self.autoencoder.encode(x)
+        x_0 = posterior.sample()
         loss = self.p_loss(x_0)
         self.log('TL', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         
@@ -366,7 +401,8 @@ class LatentDiffusion(pl.LightningModule):
         x -> encode -> z
         '''
         x, y = batch
-        x_0 = self.autoencoder.encode(x)
+        posterior = self.autoencoder.encode(x)
+        x_0 = posterior.sample()
         loss = self.p_loss(x_0)
         self.log('TeL', loss, on_step=False, on_epoch=True, sync_dist=True)
 
@@ -388,19 +424,38 @@ class LatentDiffusion(pl.LightningModule):
     @torch.no_grad()
     def sample_images(self):
 
-        try:
-            samples = self.generate(self.grid**2, self.diffusion_steps)
-            
-            samples_dir = os.path.join(self.logger.log_dir, "Samples")
-            os.makedirs(samples_dir, exist_ok=True)
+        if self.autoencoder is not None:
+            test_input, test_label = next(iter(self.trainer.datamodule.test_dataloader()))
+            test_input = test_input.to(self.device)
+            test_label = test_label.to(self.device)
+            recons = self.autoencoder(test_input)[0]
+            recons_dir = os.path.join(self.logger.log_dir, "Autoencoder")
+            original_dir = os.path.join(self.logger.log_dir, "Original")
+            os.makedirs(original_dir, exist_ok=True)
+            os.makedirs(recons_dir, exist_ok=True)
 
-            vutils.save_image(samples.cpu().data,
-                              os.path.join(samples_dir,
-                                           f"{self.logger.name}_Epoch_{self.current_epoch}.png"),
+            vutils.save_image(test_input,
+                              os.path.join(original_dir,
+                                           f"originals_{self.logger.name}_Epoch_{self.current_epoch}.png"),
                               normalize=True,
-                              nrow=self.grid)
-        except Warning:
-            pass
+                              nrow=4)
+
+            vutils.save_image(recons.data,
+                              os.path.join(recons_dir,
+                                           f"recons_{self.logger.name}_Epoch_{self.current_epoch}.png"),
+                              normalize=True,
+                              nrow=4)
+
+        samples = self.generate(self.grid**2, self.diffusion_steps)
+        
+        samples_dir = os.path.join(self.logger.log_dir, "Samples")
+        os.makedirs(samples_dir, exist_ok=True)
+
+        vutils.save_image(samples.cpu().data,
+                            os.path.join(samples_dir,
+                                        f"{self.logger.name}_Epoch_{self.current_epoch}.png"),
+                            normalize=True,
+                            nrow=self.grid)
 
     @classmethod
     def load_from_checkpoint(cls, checkpoint_path, config, *args, **kwargs):

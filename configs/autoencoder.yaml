@@ -4,18 +4,20 @@ model_config:
   learning_rate: 0.0001
   h_dims: [3, 128, 128, 128]
   in_res: 224
-  attn_res: [14]
+  attn_res: [56]
   down_index: [0, 1, 1, 0]
+  z_channels: 4
+  embed_dim: 4
+  double_z: True
   dropout: 0.1
   with_conv: True
-  latent_dim: 128
   diffusion_steps: 100
   sampling_period: 1
   grid: 2
   kld_factor: 0.0001
-  weight_decay: 0.00001
+  weight_decay: 0.001
   scheduler_gamma: 0.99
-  deterministic: True
+  deterministic: False
 
 data_config:
   data_dir: "data/flowers/train"
@@ -27,7 +29,7 @@ data_config:
 trainer_config:
   accelerator: 'gpu'
   devices: 1
-  max_epochs: 1
+  max_epochs: 200
   precision: 16-mixed
 
 log_config:

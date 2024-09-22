@@ -2,13 +2,13 @@ model_config:
   name: 'ldm'
   manual_seed: 42
   learning_rate: 0.0001
-  h_dims: [128, 128, 128] # 56, 28, 14
+  h_dims: [4, 128, 128, 128] # 56, 28, 14, 14
   in_res: 56
   attn_res: [14]
-  down_index: [0, 1, 1]
+  down_index: [0, 1, 1, 0]
   with_conv: True
   dropout: 0.1
-  diffusion_steps: 100
+  diffusion_steps: 50
   sampling_period: 1
   grid: 2
   weight_decay: 0.00001
@@ -17,7 +17,7 @@ model_config:
 data_config:
   data_dir: "data/flowers/train"
   in_res: 56
-  batch_size: 16
+  batch_size: 4
   num_workers: 4
   use_manual_split: True
 
@@ -32,5 +32,4 @@ log_config:
   save_dir: "logs/"
   check_dir: "logs/check"
   checkpoint: False
-  model_summary: False
   

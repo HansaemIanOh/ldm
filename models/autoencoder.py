@@ -82,11 +82,14 @@ class ResNetBlock(nn.Module):
 class AttnBlock(nn.Module):
     def __init__(self, features):
         super().__init__()
+        self.features = features
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=features, eps=1e-6, affine=True)
+
         self.q_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
         self.k_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
         self.v_proj = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
         self.linear = nn.Conv2d(features, features, kernel_size=(1, 1), stride=1, padding=0)
-        self.norm = nn.GroupNorm(num_groups=32, num_channels=features, eps=1e-6, affine=True)
+        
 
     def forward(self, x : Tensor) -> Tensor:
         '''
@@ -94,6 +97,7 @@ class AttnBlock(nn.Module):
         return : [B, C, H, W]
         '''
         h = x
+        # print(self.features, h.shape)
         h = self.norm(h)
         q = self.q_proj(h)
         k = self.k_proj(h)
@@ -108,6 +112,7 @@ class AttnBlock(nn.Module):
         w = F.softmax(w, dim=-1)
         w = w.permute(0, 2, 1).contiguous()
         h = torch.einsum('BFs, BsS -> BFS', v, w)
+        h = h.view(B, C, H, W)
         h = self.linear(h)
         return x + h
 
@@ -236,9 +241,11 @@ class AutoEncoderKL(pl.LightningModule):
         in_res = config.get('in_res')
         attn_res = config.get('attn_res')
         down_index = config.get('down_index')
+        z_channels = config.get('z_channels')
+        embed_dim = config.get('embed_dim')
+        double_z = config.get('double_z')
         dropout = config.get('dropout')
         with_conv = config.get('with_conv')
-        latent_dim = config.get('latent_dim')
         self.kld_factor = config.get('kld_factor')
         self.sampling_period = config.get('sampling_period')
         self.deterministic = config.get('deterministic')
@@ -253,14 +260,29 @@ class AutoEncoderKL(pl.LightningModule):
             with_conv,
             act
         )
-        self.quant_conv = nn.Conv2d(h_dims[-1], 2*latent_dim, kernel_size=(1, 1), stride=1, padding=0)
+        # For encoder
+        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=h_dims[-1], eps=1e-6, affine=True)
+        self.conv_out = nn.Conv2d(h_dims[-1], 
+                                  2*z_channels if double_z else z_channels,
+                                  kernel_size = 3,
+                                  stride = 1,
+                                  padding = 1
+                                  )
+        self.quant_conv = nn.Conv2d(2*z_channels, 2*embed_dim, kernel_size=(1, 1), stride=1, padding=0)
 
-        self.post_quant_conv = nn.Conv2d(latent_dim, h_dims[-1], 1)
         in_res = self.Encoder.f_res
-        h_dims.reverse()
+        reverse_h_dims = h_dims[::-1]
         up_index = down_index[::-1]
+        # For decoder
+        self.post_quant_conv = nn.Conv2d(embed_dim, embed_dim, 1)
+        self.conv_in = torch.nn.Conv2d(embed_dim,
+                                       reverse_h_dims[0],
+                                       kernel_size=3,
+                                       stride=1,
+                                       padding=1)
+
         self.Decoder = Decoder(
-            h_dims,
+            reverse_h_dims,
             in_res,
             attn_res,
             up_index,
@@ -268,7 +290,7 @@ class AutoEncoderKL(pl.LightningModule):
             with_conv,
             act
         )
-        # self.discriminator = NLayerDiscriminator()
+        self.discriminator = NLayerDiscriminator()
         self.Distribution = DiagonalGaussianDistribution
 
     def forward(self, x: Tensor) -> Tensor:
@@ -281,12 +303,15 @@ class AutoEncoderKL(pl.LightningModule):
     def encode(self, x: Tensor) -> Tensor:
         h = x
         h = self.Encoder(h)
+        h = self.norm_out(h)
+        h = self.conv_out(h)
         moments = self.quant_conv(h)
         posterior = self.Distribution(moments, deterministic=self.deterministic)
         return posterior
 
     def decode(self, z: Tensor) -> Tensor:
         z = self.post_quant_conv(z)
+        z = self.conv_in(z)
         dec = self.Decoder(z)
         return dec
 
@@ -304,13 +329,12 @@ class AutoEncoderKL(pl.LightningModule):
             return bce_loss(logits_fake, torch.ones_like(logits_fake))
         if idx==1: # Discriminator
             # Discriminator tries to maximize log(D(x)) + log(1 - D(G(z)))
-            return 0.5 * (loss_real + loss_fake)
+            return disc_loss
 
     def training_step(self, batch, batch_idx):
         x, _ = batch
 
-        # optimizer_ae, optimizer_disc = self.optimizers()
-        optimizer_ae = self.optimizers()
+        optimizer_ae, optimizer_disc = self.optimizers()
 
         self.toggle_optimizer(optimizer_ae)
         x_rec, posterior = self(x)
@@ -319,16 +343,14 @@ class AutoEncoderKL(pl.LightningModule):
         # train encoder+decoder+logvar
         rec_loss = F.mse_loss(x_rec, x)
         kld_loss = posterior.kl().mean()
-        # disc_loss = self.disc_loss_func(x_rec, x, 0)
-        # ae_loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
-        ae_loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss
+        disc_loss = self.disc_loss_func(x_rec, x, 0)
+        ae_loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
         
         self.log("ae_loss", ae_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.manual_backward(ae_loss)
         optimizer_ae.step()
         optimizer_ae.zero_grad()
         self.untoggle_optimizer(optimizer_ae)
-        '''
         # train the discriminator
         self.toggle_optimizer(optimizer_disc)
         disc_loss = self.disc_factor * self.disc_loss_func(x_rec_disc, x_disc, 1)
@@ -337,7 +359,6 @@ class AutoEncoderKL(pl.LightningModule):
         optimizer_disc.zero_grad()
         self.untoggle_optimizer(optimizer_disc)
         self.log("disc_loss", disc_loss.detach() / self.disc_factor, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        '''
 
     def validation_step(self, batch, batch_idx):
         x, _ = batch
@@ -345,9 +366,8 @@ class AutoEncoderKL(pl.LightningModule):
             x_rec, posterior = self(x)
             rec_loss = F.mse_loss(x_rec, x)
             kld_loss = posterior.kl().mean()
-            # disc_loss = self.disc_loss_func(x_rec, x, 0)
-            # loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
-            loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss
+            disc_loss = self.disc_loss_func(x_rec, x, 0)
+            loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
         self.log('VL', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
     def test_step(self, batch, batch_idx):
@@ -356,9 +376,8 @@ class AutoEncoderKL(pl.LightningModule):
             x_rec, posterior = self(x)
             rec_loss = F.mse_loss(x_rec, x)
             kld_loss = posterior.kl().mean()
-            # disc_loss = self.disc_loss_func(x_rec, x, 0)
-            # loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
-            loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss
+            disc_loss = self.disc_loss_func(x_rec, x, 0)
+            loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
         self.log('TeL', loss, on_step=False, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
@@ -371,8 +390,6 @@ class AutoEncoderKL(pl.LightningModule):
             lr=self.config['learning_rate'],
             weight_decay=self.config['weight_decay']
         )
-        return optimizer_ae
-        '''
         optimizer_disc = \
         torch.optim.AdamW(
             self.discriminator.parameters(),
@@ -387,7 +404,6 @@ class AutoEncoderKL(pl.LightningModule):
             return optimizer, scheduler
         else:
             return optimizer, []
-        '''
 
     def on_validation_epoch_end(self):
         if self.current_epoch % self.sampling_period == 0:

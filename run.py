@@ -9,7 +9,6 @@ from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning import seed_everything
 from dataloader import ImageFolderDataModule
 from models import get_model
-from torchinfo import summary
 from safetensors.torch import save_file, load_file
 from utils import SafetensorsCheckpoint
 import shutil
@@ -32,7 +31,7 @@ def read_yaml(path):
 config = read_yaml(args.config)
 if args.config_ae is not None:
     config_ae = read_yaml(args.config_ae)
-    logger_ae = TensorBoardLogger(save_dir=config_ae['log_config']['save_dir'], name=config_ae['log_config']['name'])
+    config['model_config']['ae_config'] = config_ae['model_config']
 data_module = ImageFolderDataModule(**config['data_config'])
 
 data_module.setup()
@@ -57,22 +56,9 @@ def load_model(config, model, logger):
             print(f"Error loading checkpoint: {e}")
     return model
 
-if args.config_ae is not None:
-    model_ae_temp = get_model(config_ae['model_config']['name'], config_ae['model_config'])
-    model_ae = load_model(config_ae, model_ae_temp, logger_ae)
-    config['model_config']['autoencoder'] = model_ae
-
 model = get_model(config['model_config']['name'], config['model_config'])
 
 model = load_model(config, model, logger)
-
-in_res = config['model_config']['in_res']
-
-@rank_zero_only
-def model_summary(model, input_size=(1, 3, in_res, in_res)):
-    summary(model, input_size=input_size)
-if config['log_config']['model_summary']:
-    model_summary(model, input_size=(1, 3, in_res, in_res))
 
 # Checkpoint callback
 safetensors_callback = SafetensorsCheckpoint(
