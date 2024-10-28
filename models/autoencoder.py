@@ -11,6 +11,11 @@ from safetensors.torch import save_file, load_file
 from .distributions import DiagonalGaussianDistribution
 from .discriminator import NLayerDiscriminator
 
+class nonlinearity(nn.Module):
+    def forward(self, x):
+        # swish
+        return x * torch.sigmoid(x)
+
 class DownBlock(nn.Module):
     def __init__(self, in_features, out_features, act, with_conv=True):
         super().__init__()
@@ -97,22 +102,19 @@ class AttnBlock(nn.Module):
         return : [B, C, H, W]
         '''
         h = x
-        # print(self.features, h.shape)
         h = self.norm(h)
         q = self.q_proj(h)
         k = self.k_proj(h)
         v = self.v_proj(h)
         B, C, H, W = x.shape
-        # S = HW, F = C, s = S, S:For q, s:For k and v
-        q = q.view(B, C, H*W) # [B, F, S]
-        q = q.permute(0, 2, 1).contiguous() # [B, S, F]
-        k = k.view(B, C, H*W) # [B, F, s]
-        v = v.view(B, C, H*W) # [B, F, s]
-        w = torch.einsum('BSF, BFs -> BSs', q, k) * (C ** (-0.5))
+        # S = HW, F = C, q : BSF | k, v : BsF, S = s
+        q = q.view(B, C, H*W).permute(0, 2, 1).contiguous() # [B, F, S]
+        k = k.view(B, C, H*W).permute(0, 2, 1).contiguous() # [B, F, s]
+        v = v.view(B, C, H*W).permute(0, 2, 1).contiguous() # [B, F, s]
+        w = torch.einsum('BSF, BFs -> BSs', q, k.transpose(1, 2)) * (C ** (-0.5))
         w = F.softmax(w, dim=-1)
-        w = w.permute(0, 2, 1).contiguous()
-        h = torch.einsum('BFs, BsS -> BFS', v, w)
-        h = h.view(B, C, H, W)
+        h = torch.einsum('BSs, BsF -> BSF', w, v)
+        h = h.permute(0, 2, 1).contiguous().view(B, C, H, W)
         h = self.linear(h)
         return x + h
 
@@ -249,8 +251,10 @@ class AutoEncoderKL(pl.LightningModule):
         self.kld_factor = config.get('kld_factor')
         self.sampling_period = config.get('sampling_period')
         self.deterministic = config.get('deterministic')
+        self.gan = config.get('gan')
 
-        act = nn.ReLU()
+        act = nonlinearity()
+
         self.Encoder = Encoder(
             h_dims,
             in_res,
@@ -290,7 +294,8 @@ class AutoEncoderKL(pl.LightningModule):
             with_conv,
             act
         )
-        self.discriminator = NLayerDiscriminator()
+        if self.gan:
+            self.discriminator = NLayerDiscriminator()
         self.Distribution = DiagonalGaussianDistribution
 
     def forward(self, x: Tensor) -> Tensor:
@@ -334,8 +339,10 @@ class AutoEncoderKL(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, _ = batch
 
-        optimizer_ae, optimizer_disc = self.optimizers()
-
+        if self.gan:
+            optimizer_ae, optimizer_disc = self.optimizers()
+        else:
+            optimizer_ae = self.optimizers()
         self.toggle_optimizer(optimizer_ae)
         x_rec, posterior = self(x)
         x_disc = x.clone().detach()
@@ -343,22 +350,25 @@ class AutoEncoderKL(pl.LightningModule):
         # train encoder+decoder+logvar
         rec_loss = F.mse_loss(x_rec, x)
         kld_loss = posterior.kl().mean()
-        disc_loss = self.disc_loss_func(x_rec, x, 0)
-        ae_loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
-        
+        if self.gan:
+            disc_loss = self.disc_loss_func(x_rec, x, 0)
+            ae_loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
+        else:
+            ae_loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss
         self.log("ae_loss", ae_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.manual_backward(ae_loss)
         optimizer_ae.step()
         optimizer_ae.zero_grad()
         self.untoggle_optimizer(optimizer_ae)
-        # train the discriminator
-        self.toggle_optimizer(optimizer_disc)
-        disc_loss = self.disc_factor * self.disc_loss_func(x_rec_disc, x_disc, 1)
-        self.manual_backward(disc_loss)
-        optimizer_disc.step()
-        optimizer_disc.zero_grad()
-        self.untoggle_optimizer(optimizer_disc)
-        self.log("disc_loss", disc_loss.detach() / self.disc_factor, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        if self.gan:
+            # train the discriminator
+            self.toggle_optimizer(optimizer_disc)
+            disc_loss = self.disc_factor * self.disc_loss_func(x_rec_disc, x_disc, 1)
+            self.manual_backward(disc_loss)
+            optimizer_disc.step()
+            optimizer_disc.zero_grad()
+            self.untoggle_optimizer(optimizer_disc)
+            self.log("disc_loss", disc_loss.detach() / self.disc_factor, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
         x, _ = batch
@@ -366,8 +376,11 @@ class AutoEncoderKL(pl.LightningModule):
             x_rec, posterior = self(x)
             rec_loss = F.mse_loss(x_rec, x)
             kld_loss = posterior.kl().mean()
-            disc_loss = self.disc_loss_func(x_rec, x, 0)
-            loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
+            if self.gan:
+                disc_loss = self.disc_loss_func(x_rec, x, 0)
+                loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
+            else:
+                loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss
         self.log('VL', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
     def test_step(self, batch, batch_idx):
@@ -376,8 +389,11 @@ class AutoEncoderKL(pl.LightningModule):
             x_rec, posterior = self(x)
             rec_loss = F.mse_loss(x_rec, x)
             kld_loss = posterior.kl().mean()
-            disc_loss = self.disc_loss_func(x_rec, x, 0)
-            loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
+            if self.gan:
+                disc_loss = self.disc_loss_func(x_rec, x, 0)
+                loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss + self.disc_factor * disc_loss
+            else:
+                loss = self.rec_factor * rec_loss + self.kld_factor * kld_loss
         self.log('TeL', loss, on_step=False, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
@@ -390,17 +406,20 @@ class AutoEncoderKL(pl.LightningModule):
             lr=self.config['learning_rate'],
             weight_decay=self.config['weight_decay']
         )
-        optimizer_disc = \
-        torch.optim.AdamW(
-            self.discriminator.parameters(),
-            lr=self.config['learning_rate'],
-            weight_decay=self.config['weight_decay']
-        )
-        optimizer = [optimizer_ae, optimizer_disc]
+        optimizer = [optimizer_ae]
+        if self.gan:
+            optimizer_disc = \
+            torch.optim.AdamW(
+                self.discriminator.parameters(),
+                lr=self.config['learning_rate'],
+                weight_decay=self.config['weight_decay']
+            )
+            optimizer = optimizer + [optimizer_disc]
         if self.config['scheduler_gamma'] is not None:
             scheduler_ae = torch.optim.lr_scheduler.ExponentialLR(optimizer = optimizer_ae, gamma = self.config['scheduler_gamma'])
-            scheduler_disc = torch.optim.lr_scheduler.ExponentialLR(optimizer = optimizer_disc, gamma = self.config['scheduler_gamma'])
-            scheduler = [scheduler_ae, scheduler_disc]
+            if self.gan:
+                scheduler_disc = torch.optim.lr_scheduler.ExponentialLR(optimizer = optimizer_disc, gamma = self.config['scheduler_gamma'])
+            scheduler = [scheduler_ae, scheduler_disc] if self.gan else [scheduler_ae]
             return optimizer, scheduler
         else:
             return optimizer, []

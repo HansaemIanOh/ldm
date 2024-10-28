@@ -8,7 +8,7 @@ model_config:
   down_index: [0, 1, 1, 0]
   with_conv: True
   dropout: 0.1
-  diffusion_steps: 50
+  diffusion_steps: 1000
   sampling_period: 1
   grid: 2
   weight_decay: 0.00001
@@ -31,5 +31,5 @@ log_config:
   name: "ldm"
   save_dir: "logs/"
   check_dir: "logs/check"
-  checkpoint: False
+  checkpoint: True
   

@@ -113,15 +113,13 @@ class AttnBlock(nn.Module):
         v = self.v_proj(h)
         B, C, H, W = x.shape
         # S = HW, F = C, s = S, S:For q, s:For k and v
-        q = q.view(B, C, H*W) # [B, F, S]
-        q = q.permute(0, 2, 1).contiguous() # [B, S, F]
-        k = k.view(B, C, H*W) # [B, F, s]
-        v = v.view(B, C, H*W) # [B, F, s]
-        w = torch.einsum('BSF, BFs -> BSs', q, k) * (C ** (-0.5))
+        q = q.view(B, C, H*W).permute(0, 2, 1).contiguous() # [B, S, F]
+        k = k.view(B, C, H*W).permute(0, 2, 1).contiguous() # [B, s, F]
+        v = v.view(B, C, H*W).permute(0, 2, 1).contiguous() # [B, s, F]
+        w = torch.einsum('BSF, BFs -> BSs', q, k.transpose(1, 2)) * (C ** (-0.5))
         w = F.softmax(w, dim=-1)
-        w = w.permute(0, 2, 1).contiguous()
-        h = torch.einsum('BFs, BsS -> BFS', v, w)
-        h = h.view(B, C, H, W)
+        h = torch.einsum('BSs, BsF -> BSF', w, v)
+        h = h.permute(0, 2, 1).contiguous().view(B, C, H, W)
         h = self.linear(h)
         return x + h
 
