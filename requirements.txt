@@ -15,8 +15,4 @@ safetensors==0.4.3 # 2024-04-16
 transformers==4.42.0 # 2024-06-28
 datasets==2.20.0 # 2024-06-13
 flask==3.0.3 # 2024-04-08
-<<<<<<< HEAD
 taming-transformers
-=======
-taming-transformers
->>>>>>> 503acd2a5179f585b7ea0557fe87e73c5d52e757
